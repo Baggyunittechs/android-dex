@@ -1,5 +1,11 @@
-# stream.py - Android virtual desktop (scrcpy-server v3.1, new_display)
-# Low-latency decode + 1440p + freeform windows + custom Recents + unlock flow
+# stream_v3.py
+# Sharp HD Android virtual desktop (scrcpy-server v3.1, new_display)
+#  - Low-latency pipeline (frame meta, low-delay decode, latest-frame-only rendering)
+#  - Higher resolution presets (1080p / 1440p / 2160p) with matching DPI
+#  - Freeform "desktop mode" setup (draggable / resizable app windows)
+#  - Own Recents panel (the system one is empty on a virtual display)
+#  - Lock screen unlock flow, Ctrl+U, F11 fullscreen
+import json
 import random
 import re
 import shlex
@@ -8,10 +14,11 @@ import struct
 import sys
 import threading
 import time
+from pathlib import Path
 
 import av
 from adbutils import adb
-from PyQt6.QtCore import QRectF, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPainter
 from PyQt6.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QMainWindow,
@@ -24,40 +31,74 @@ LOCAL_PORT = 27183
 SCROLL_SIGN = 1
 
 # ----------------------------------------------------------------------
-# Quality / performance config
+# Resolution presets: (width, height, dpi, bitrate)
+# dp width = px * 160 / dpi, so 1440p@320 gives the same UI size as 1080p@240,
+# just sharper. Higher resolution costs more encode/decode time.
 # ----------------------------------------------------------------------
-# name: (width, height, dpi, bitrate). Every preset keeps the same UI size
-# (dp width = px * 160 / dpi = 1280dp); higher presets are just sharper
-# and cost more encode/decode time. Drop to "1080p" if it gets laggy.
 PRESETS = {
     "1080p": (1920, 1080, 240, 16_000_000),
     "1440p": (2560, 1440, 320, 28_000_000),
     "2160p": (3840, 2160, 480, 50_000_000),
 }
 RESOLUTION = "1440p"
-DPI_OVERRIDE = None   # e.g. 280 -> bigger UI, 360 -> smaller UI (at 1440p)
+DPI_OVERRIDE = None          # e.g. 280 for a slightly larger UI than the preset
 DISPLAY_W, DISPLAY_H, DISPLAY_DPI, VIDEO_BITRATE = PRESETS[RESOLUTION]
 if DPI_OVERRIDE:
     DISPLAY_DPI = DPI_OVERRIDE
 
-MAX_FPS = 60
-# True: scrcpy sends packet headers, so we skip the H.264 parser (which waits
-# for the next frame before releasing the current one = +1 frame of latency).
-USE_FRAME_META = True
-# Mouse-move throttle (seconds). Stops hi-rate mice flooding the phone's
-# input queue, a common cause of touch delay.
-MOUSE_MOVE_INTERVAL = 0.008
-# 1.0 = default. 0.5 = twice as fast animations. None = leave untouched.
-# Applied at start and restored on exit (global setting on the phone).
-ANIMATION_SCALE = 0.5
+APPLY_WM_DENSITY = False       # fallback if new_display's DPI isn't honored
+VD_SYSTEM_DECORATIONS = True   # False -> vd_system_decorations=false (verify support)
 
-# Freeform "desktop mode" so windows get title bars you can drag/resize.
-# Needs a one-time phone reboot after the first run on most devices.
-ENABLE_FREEFORM = True
-# Fallback only: force density via `wm density -d <id>`.
-APPLY_WM_DENSITY = False
-# False -> passes vd_system_decorations=false (hides system navbar/launcher).
-VD_SYSTEM_DECORATIONS = True
+# ----------------------------------------------------------------------
+# Latency / smoothness
+# ----------------------------------------------------------------------
+USE_FRAME_META = True          # packet boundaries from server: no parser delay
+MOUSE_MOVE_INTERVAL = 0.008    # throttle drag events (~120 Hz)
+# Android animation speed multiplier (1.0 = normal, 0.5 = twice as fast).
+# Applied on connect and restored on exit. None = don't touch.
+ANIMATION_SCALE = 0.5
+ANIM_KEYS = ("window_animation_scale", "transition_animation_scale",
+             "animator_duration_scale")
+
+# ----------------------------------------------------------------------
+# Desktop (freeform) mode: draggable/resizable windows with title bars.
+# Applied once; some devices need ONE reboot before it takes effect.
+# ----------------------------------------------------------------------
+# How this script treats the phone's freeform/window settings:
+# "off"        : don't touch them (use the toggles you set in Developer options
+#                > Window management). Recommended.
+# "session"    : turned on when you connect, restored when you disconnect
+# "persistent" : stays on until you run  python stream_v3.py --restore
+FREEFORM_MODE = "off"
+# Launch apps opened from our Recents panel as freeform (draggable) windows
+LAUNCH_FREEFORM = True
+
+# Auto-window: when a new app opens fullscreen on the desktop, it is switched
+# to a draggable / resizable window automatically (small flicker on open).
+AUTO_WINDOW = True
+WINDOW_FRACTION = (0.70, 0.78)   # default window size (fraction of display)
+WINDOW_CASCADE = 56              # px offset between successive windows
+# SystemUI can keep stale per-display state after the virtual display goes
+# away (symptom: back-swipe gesture dead until reboot). Restarting it on
+# exit avoids that. Only done after a freeform session.
+RESTART_SYSTEMUI_AFTER_FREEFORM = True
+BACKUP_PATH = Path.home() / ".stream_v3_phone_backup.json"
+
+# Audio: "auto" (both on Android 13+, else PC only) | "pc" | "both" | "off"
+#  pc   = phone audio plays on this computer only (phone goes quiet)
+#  both = plays on the computer AND the phone (needs Android 13+)
+# Android cannot split audio per display, so this applies to everything
+# the phone plays (not calls/ringtones).
+AUDIO_MODE = "auto"
+
+LOCK_POLL_INTERVAL = 1.5                 # seconds between lock/sleep checks
+DPI_STEP, DPI_MIN, DPI_MAX = 20, 160, 640  # Ctrl +/- live UI scaling
+FREEFORM_SETTINGS = {
+    "enable_freeform_support": "1",
+    "force_resizable_activities": "1",
+    "freeform_window_management": "1",
+    "force_desktop_mode_on_external_displays": "1",
+}
 
 # scrcpy control message types
 MSG_KEYCODE, MSG_TEXT, MSG_TOUCH, MSG_SCROLL, MSG_DISPLAY_POWER = 0, 1, 2, 3, 10
@@ -78,12 +119,18 @@ SPECIAL_KEYS = {
     Qt.Key.Key_Left: 21, Qt.Key.Key_Right: 22,
     Qt.Key.Key_Home: 122, Qt.Key.Key_End: 123,
     Qt.Key.Key_PageUp: 92, Qt.Key.Key_PageDown: 93,
-    Qt.Key.Key_W: 51, Qt.Key.Key_A: 29,
-    Qt.Key.Key_S: 32, Qt.Key.Key_D: 30,
 }
 
-ANIM_KEYS = ("window_animation_scale", "transition_animation_scale",
-             "animator_duration_scale")
+# Only used while game mode is on (F10). Otherwise W/A/S/D are typed as
+# normal text so capitals and shift work.
+GAME_KEYS = {Qt.Key.Key_W: 51, Qt.Key.Key_A: 29,
+             Qt.Key.Key_S: 32, Qt.Key.Key_D: 30}
+
+try:
+    from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+    HAVE_AUDIO = True
+except ImportError:
+    HAVE_AUDIO = False
 
 DECODE_ERRORS = tuple(c for c in (getattr(av.error, "FFmpegError", None),
                                   av.error.InvalidDataError) if c)
@@ -99,7 +146,7 @@ QPushButton#OverlayBtn {
     border: 1px solid rgba(255, 255, 255, 40);
     border-radius: 8px;
     padding: 6px 12px;
-    font-family: 'Segoe UI', sans-serif;
+    font-family: 'Segoe UI', 'Noto Sans', 'Ubuntu', sans-serif;
     font-weight: 600;
     font-size: 11px;
 }
@@ -110,66 +157,180 @@ QPushButton#OverlayBtn:hover {
 QPushButton#OverlayBtn:pressed {
     background-color: #0b57d0;
 }
+QPushButton#LockBanner {
+    background-color: rgba(11, 87, 208, 245);
+    color: #ffffff;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-family: 'Segoe UI', 'Noto Sans', 'Ubuntu', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+}
+QPushButton#LockBanner:hover {
+    background-color: rgba(30, 110, 230, 255);
+}
+QLabel#Toast {
+    background-color: rgba(20, 20, 25, 235);
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 50);
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-family: 'Segoe UI', 'Noto Sans', 'Ubuntu', sans-serif;
+    font-size: 12px;
+}
 QWidget#RecentsPanel {
     background-color: rgba(0, 0, 0, 190);
 }
 QLabel#RecentsTitle {
     color: #ffffff;
-    font-family: 'Segoe UI', sans-serif;
+    font-family: 'Segoe UI', 'Noto Sans', 'Ubuntu', sans-serif;
     font-size: 20px;
     font-weight: 600;
-    padding-bottom: 12px;
 }
 QLabel#RecentsEmpty {
-    color: rgba(255, 255, 255, 170);
-    font-family: 'Segoe UI', sans-serif;
+    color: rgba(255, 255, 255, 180);
+    font-family: 'Segoe UI', 'Noto Sans', 'Ubuntu', sans-serif;
     font-size: 14px;
 }
 QFrame#RecentsCard {
-    background-color: rgba(32, 33, 40, 245);
+    background-color: rgba(30, 30, 38, 245);
     border: 1px solid rgba(255, 255, 255, 40);
     border-radius: 12px;
 }
 QPushButton#CardBtn {
-    background: transparent;
+    background-color: transparent;
     color: #ffffff;
     border: none;
     text-align: left;
     padding: 14px 16px;
-    font-family: 'Segoe UI', sans-serif;
+    font-family: 'Segoe UI', 'Noto Sans', 'Ubuntu', sans-serif;
     font-size: 13px;
     font-weight: 600;
 }
 QPushButton#CardBtn:hover {
-    background-color: rgba(255, 255, 255, 25);
+    background-color: rgba(11, 87, 208, 120);
     border-radius: 12px;
 }
 QPushButton#CardClose {
-    background: transparent;
-    color: rgba(255, 255, 255, 160);
+    background-color: transparent;
+    color: rgba(255, 255, 255, 170);
     border: none;
     padding: 6px 12px;
-    font-size: 13px;
     font-weight: 700;
 }
 QPushButton#CardClose:hover {
-    color: #ff6b6b;
+    color: #ffffff;
+    background-color: rgba(200, 40, 40, 200);
+    border-radius: 8px;
 }
 """
 
 
-def _extract_packets(buf: bytearray):
+def _read_backup():
+    try:
+        data = json.loads(BACKUP_PATH.read_text())
+        data.setdefault("transient", {})
+        data.setdefault("persistent", {})
+        return data
+    except (OSError, ValueError):
+        return {"transient": {}, "persistent": {}}
+
+
+def _write_backup(data):
+    try:
+        if data["transient"] or data["persistent"]:
+            BACKUP_PATH.write_text(json.dumps(data))
+        elif BACKUP_PATH.exists():
+            BACKUP_PATH.unlink()
+    except OSError:
+        pass
+
+
+def _apply_saved(d, saved):
+    """Put phone settings back to their recorded values ('null' = unset)."""
+    for k, v in saved.items():
+        try:
+            if v in ("", "null"):
+                d.shell(f"settings delete global {k}")
+            else:
+                d.shell(f"settings put global {k} {v}")
+        except Exception:
+            pass
+
+
+def restore_phone_settings():
+    """CLI: python stream_v3.py --restore"""
+    devices = adb.device_list()
+    if not devices:
+        print("No device found")
+        return
+    d = devices[0]
+    data = _read_backup()
+    saved = {**data["persistent"], **data["transient"]}
+    if not saved:
+        # No backup (e.g. a crash before it was written): only reset the
+        # animation speeds. Freeform toggles are left alone because you may
+        # have turned them on yourself in Developer options.
+        saved = {k: "null" for k in ANIM_KEYS}
+        print("No backup found; resetting animation speeds only")
+    _apply_saved(d, saved)
+    _write_backup({"transient": {}, "persistent": {}})
+    print("Phone settings restored:", ", ".join(saved))
+
+
+def _split_meta(buf: bytearray):
     """Split scrcpy frame-meta stream: [u64 pts/flags][u32 size][payload]."""
-    pkts = []
+    out = []
     while len(buf) >= 12:
         size = struct.unpack_from(">I", buf, 8)[0]
         if len(buf) < 12 + size:
             break
+        flags = struct.unpack_from(">Q", buf, 0)[0]
         payload = bytes(buf[12:12 + size])
         del buf[:12 + size]
-        if payload:
-            pkts.append(av.Packet(payload))
-    return pkts
+        out.append((flags, payload))
+    return out
+
+
+def _extract_packets(buf: bytearray):
+    return [av.Packet(p) for _, p in _split_meta(buf) if p]
+
+
+class AudioPlayer:
+    """Plays the phone's audio on this computer (48 kHz, 16-bit, stereo)."""
+
+    def __init__(self):
+        self.ok = False
+        self.muted = False
+        self.sink = None
+        self.io = None
+        try:
+            dev = QMediaDevices.defaultAudioOutput()
+            if dev.isNull():
+                print("No audio output device found")
+                return
+            fmt = QAudioFormat()
+            fmt.setSampleRate(48000)
+            fmt.setChannelCount(2)
+            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+            self.sink = QAudioSink(dev, fmt)
+            self.sink.setBufferSize(48000 * 4 // 8)   # ~125 ms
+            self.io = self.sink.start()
+            self.ok = self.io is not None
+        except Exception as e:
+            print(f"Audio output unavailable: {e!r}")
+
+    def write(self, data: bytes):
+        if not self.ok or self.muted:
+            return
+        n = min(len(data), self.sink.bytesFree()) & ~3   # whole frames only
+        if n > 0:
+            self.io.write(data[:n])
+
+    def close(self):
+        if self.sink:
+            self.sink.stop()
 
 
 class StreamWorker(QThread):
@@ -177,6 +338,8 @@ class StreamWorker(QThread):
     status = pyqtSignal(str)
     pin_requested = pyqtSignal()
     recents_ready = pyqtSignal(list)
+    lock_changed = pyqtSignal(bool)     # True = phone asleep/locked, desktop stalled
+    audio_data = pyqtSignal(bytes)
 
     def __init__(self):
         super().__init__()
@@ -194,16 +357,30 @@ class StreamWorker(QThread):
         self._frame_lock = threading.Lock()
         self._latest = None
         self._frame_pending = False
-        self._saved_anim = {}
+        self._backup = {"transient": {}, "persistent": {}}
+        self.sdk = 0
+        self.audio_sock = None
+        self._audio_mode = None
+        self._input_cmd = "input"
+        self._fail_count = 0
+        self._block_until = 0.0
+        self._last_frame = time.monotonic()
+        self._freeform_applied = False
+        self.current_dpi = DISPLAY_DPI
+        self._seen_tasks = set()
+        self._win_fail = 0
+        self._auto_window_on = AUTO_WINDOW
+        self._cascade = 0
 
     def stop(self):
         self._running = False
         self._pin_event.set()  # release any pending PIN wait
 
     # ------------------------------------------------------------------
-    # Frame hand-off (latest-frame-wins: UI never builds a backlog)
+    # Latest-frame-only hand-off (never queue stale frames)
     # ------------------------------------------------------------------
     def _publish(self, img):
+        self._last_frame = time.monotonic()
         with self._frame_lock:
             self._latest = img
             if self._frame_pending:
@@ -218,44 +395,80 @@ class StreamWorker(QThread):
         return img
 
     # ------------------------------------------------------------------
-    # Phone-side setup
+    # Device settings: desktop mode + animation speed
     # ------------------------------------------------------------------
+    def _set_global(self, d, key, value, kind):
+        """Record the original value (crash-safe, on disk) then change it.
+        kind: 'transient' = restored on exit, 'persistent' = kept until --restore"""
+        bucket = self._backup[kind]
+        if key not in bucket:
+            bucket[key] = d.shell(f"settings get global {key}").strip()
+            _write_backup(self._backup)
+        d.shell(f"settings put global {key} {value}")
+
     def _apply_desktop_settings(self, d):
-        if not ENABLE_FREEFORM:
-            return
-        cur = d.shell(
-            "settings get global force_desktop_mode_on_external_displays"
-        ).strip()
-        if cur == "1":
-            return
-        for cmd in (
-            "settings put global enable_freeform_support 1",
-            "settings put global force_resizable_activities 1",
-            "settings put global freeform_window_management 1",
-            "settings put global force_desktop_mode_on_external_displays 1",
-        ):
-            d.shell(cmd)
-        self.status.emit(
-            "Freeform mode enabled. If windows have no title bars, "
-            "reboot the phone once and reconnect.")
-
-    def _set_animation_scale(self, d):
-        if ANIMATION_SCALE is None:
-            return
-        for k in ANIM_KEYS:
-            self._saved_anim[k] = d.shell(f"settings get global {k}").strip()
-            d.shell(f"settings put global {k} {ANIMATION_SCALE}")
-
-    def _restore_animation_scale(self, d):
-        for k, v in self._saved_anim.items():
+        if FREEFORM_MODE in ("session", "persistent"):
+            kind = "transient" if FREEFORM_MODE == "session" else "persistent"
             try:
-                if v in ("", "null"):
-                    d.shell(f"settings delete global {k}")
-                else:
-                    d.shell(f"settings put global {k} {v}")
+                for k, v in FREEFORM_SETTINGS.items():
+                    self._set_global(d, k, v, kind)
+                self._freeform_applied = True
+                self.status.emit(
+                    f"Freeform desktop mode on ({FREEFORM_MODE}). Apps opened "
+                    "from now on get title bars you can drag/resize; apps "
+                    "already open stay fullscreen, so close and reopen them.")
+            except Exception as e:
+                self.status.emit(f"Freeform setup failed: {e!r}")
+
+        if ANIMATION_SCALE is not None:
+            try:
+                for k in ANIM_KEYS:
+                    self._set_global(d, k, ANIMATION_SCALE, "transient")
+            except Exception as e:
+                self.status.emit(f"Animation scale failed: {e!r}")
+
+    def _restore_transient(self, d):
+        _apply_saved(d, self._backup["transient"])
+        self._backup["transient"] = {}
+        _write_backup(self._backup)
+
+    # ------------------------------------------------------------------
+    # Device info
+    # ------------------------------------------------------------------
+    def _probe_device(self, d):
+        try:
+            self.sdk = int(d.shell("getprop ro.build.version.sdk").strip() or 0)
+        except ValueError:
+            self.sdk = 0
+        model = d.shell("getprop ro.product.model").strip()
+        self.status.emit(f"Device: {model} (Android API {self.sdk})")
+        # Target display 0 explicitly, so keystrokes reach the lock screen even
+        # when the virtual display currently holds input focus.
+        out = d.shell("input -d 0 keyevent 0")
+        self._input_cmd = ("input" if re.search(r"sage|rror|nknown", out)
+                           else "input -d 0")
+
+    def _dump_window_settings(self, d):
+        """Print window-management related settings so we can see which keys
+        this phone actually uses (they differ between Android/OEM versions)."""
+        pat = "freeform|resizable|desktop|multi_window|multiwindow|taskbar"
+        for ns in ("global", "secure", "system"):
+            try:
+                out = d.shell(f"settings list {ns} | grep -iE '{pat}'").strip()
             except Exception:
-                pass
-        self._saved_anim = {}
+                continue
+            if out:
+                print(f"[settings {ns}]\n{out}")
+
+    def _audio_plan(self):
+        if AUDIO_MODE == "off" or not HAVE_AUDIO or self.sdk < 30:
+            return None
+        mode = AUDIO_MODE
+        if mode == "auto":
+            mode = "both" if self.sdk >= 33 else "pc"
+        if mode == "both" and self.sdk < 33:
+            mode = "pc"
+        return mode
 
     # ------------------------------------------------------------------
     # Server startup
@@ -266,13 +479,21 @@ class StreamWorker(QThread):
 
         extra = "" if VD_SYSTEM_DECORATIONS else " vd_system_decorations=false"
         meta = "true" if USE_FRAME_META else "false"
+        self._audio_mode = self._audio_plan()
+        if self._audio_mode:
+            audio_opts = "audio=true audio_codec=raw"
+            if self._audio_mode == "both":
+                audio_opts += " audio_dup=true"
+        else:
+            audio_opts = "audio=false"
         cmd = (
             f"CLASSPATH={REMOTE_JAR} app_process / com.genymobile.scrcpy.Server "
             f"{SERVER_VERSION} scid={scid:08x} log_level=info tunnel_forward=true "
-            f"audio=false control=true max_size=0 video_bit_rate={VIDEO_BITRATE} "
-            f"max_fps={MAX_FPS} send_device_meta=false send_codec_meta=false "
+            f"{audio_opts} control=true max_size=0 video_bit_rate={VIDEO_BITRATE} "
+            f"max_fps=60 send_device_meta=false send_codec_meta=false "
             f"send_frame_meta={meta} "
-            f"new_display={DISPLAY_W}x{DISPLAY_H}/{DISPLAY_DPI}{extra}"
+            f"new_display={DISPLAY_W}x{DISPLAY_H}/{DISPLAY_DPI}"
+            f"{extra}"
         )
         self._shell = d.shell(cmd, stream=True)
         conn = self._shell
@@ -312,7 +533,7 @@ class StreamWorker(QThread):
 
     def _apply_density_override(self, d):
         """Fallback if new_display's DPI isn't honored.
-        NEVER run `wm density` without -d: that changes the real screen."""
+        NEVER run `wm density` without -d: that changes the phone's real density."""
         if not APPLY_WM_DENSITY:
             return
         for _ in range(30):
@@ -339,6 +560,31 @@ class StreamWorker(QThread):
             time.sleep(0.1)
         raise RuntimeError("Could not connect video socket")
 
+    def _connect_aux(self):
+        s = socket.socket()
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.connect(("127.0.0.1", LOCAL_PORT))
+        return s
+
+    def _audio_loop(self, sock):
+        buf = bytearray()
+        sock.settimeout(1.0)
+        while self._running:
+            try:
+                data = sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            for flags, payload in _split_meta(buf):
+                if (flags >> 63) & 1:        # config packet, nothing to play
+                    continue
+                if payload:
+                    self.audio_data.emit(payload)
+
     def _connect_control(self):
         s = socket.socket()
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -355,27 +601,50 @@ class StreamWorker(QThread):
         return s
 
     # ------------------------------------------------------------------
-    # Lock screen handling (keyguard lives on the physical display 0)
+    # Lock screen handling (keyguard lives on the physical display 0,
+    # so we unlock via ADB before/while streaming the virtual display)
     # ------------------------------------------------------------------
     @staticmethod
     def _is_awake(d) -> bool:
-        return "mWakefulness=Awake" in d.shell("dumpsys power")
+        out = d.shell(
+            "dumpsys power | grep -o 'mWakefulness=[A-Za-z]*' | head -n 1")
+        # Fail safe: only report asleep when clearly Asleep/Dozing
+        return not re.search(r"Asleep|Dozing", out)
 
     @staticmethod
-    def _is_locked(d) -> bool:
-        out = d.shell("dumpsys window")
+    def _keyguard_lines(d) -> str:
+        return d.shell(
+            "dumpsys window | grep -E 'mKeyguardShowing|isKeyguardShowing|"
+            "mShowingLockscreen|mDreamingLockscreen|mBouncerShowing|"
+            "isBouncerShowing'")
+
+    @classmethod
+    def _is_locked(cls, d) -> bool:
         return bool(re.search(
             r"(mKeyguardShowing|isKeyguardShowing|mShowingLockscreen"
-            r"|mDreamingLockscreen)=true", out))
+            r"|mDreamingLockscreen)=true", cls._keyguard_lines(d)))
+
+    @staticmethod
+    def _screen_size(d):
+        found = re.findall(r"(\d+)x(\d+)", d.shell("wm size"))
+        if found:
+            w, h = found[-1]
+            return int(w), int(h)
+        return 1080, 2400
+
+    def _lock_debug(self, d) -> str:
+        lines = " ".join(
+            ln.strip() for ln in self._keyguard_lines(d).splitlines()[:6])
+        return f"awake={self._is_awake(d)} api={self.sdk} {lines}"
 
     def _wake(self, d):
         if not self._is_awake(d):
-            d.shell("input keyevent KEYCODE_WAKEUP")
+            d.shell(f"{self._input_cmd} keyevent KEYCODE_WAKEUP")
             for _ in range(30):
                 if self._is_awake(d):
                     break
                 time.sleep(0.1)
-        time.sleep(0.25)
+        time.sleep(0.3)  # let the keyguard finish animating in
 
     def provide_pin(self, pin):
         """Called from the UI thread. None = user cancelled."""
@@ -383,24 +652,59 @@ class StreamWorker(QThread):
         self._pin_event.set()
 
     def _unlock(self, d, secret: str) -> bool:
+        inp = self._input_cmd
+        self._wake(d)
+        d.shell("wm dismiss-keyguard")
+        time.sleep(0.7)
+        if not self._is_locked(d):
+            return True                    # no secure lock, or already clear
+        if not secret:
+            return False
+        w, h = self._screen_size(d)
+        # Some devices only reveal the PIN pad after a swipe up
+        d.shell(f"{inp} swipe {w // 2} {int(h * 0.85)} "
+                f"{w // 2} {int(h * 0.25)} 250")
+        time.sleep(0.8)
         if secret.isdigit():
-            keys = ";".join(f"input keyevent {7 + int(c)}" for c in secret)
+            # Digits -> KEYCODE_0..9 (7..16), small gaps so none are dropped
+            script = "; sleep 0.07; ".join(
+                f"{inp} keyevent {7 + int(c)}" for c in secret)
         else:
-            keys = "input text " + shlex.quote(secret.replace(" ", "%s"))
-        script = (
-            "wm dismiss-keyguard; sleep 0.4; "
-            "input keyevent 82; sleep 0.2; "
-            f"{keys}; sleep 0.15; input keyevent 66"
-        )
+            script = f"{inp} text {shlex.quote(secret.replace(' ', '%s'))}"
         d.shell(script)
-        for _ in range(20):
-            time.sleep(0.15)
-            if not self._is_locked(d):
-                return True
+        time.sleep(0.35)
+        if self._is_locked(d):
+            d.shell(f"{inp} keyevent 66")  # ENTER, for PINs without auto-submit
+            for _ in range(25):
+                time.sleep(0.2)
+                if not self._is_locked(d):
+                    return True
+            return False
+        return True
+
+    def _try_unlock(self, d, secret: str) -> bool:
+        if time.monotonic() < self._block_until:
+            self.status.emit("Unlock paused after repeated failures. Wait a "
+                             "minute, or unlock on the phone.")
+            return False
+        ok = self._unlock(d, secret)
+        if ok:
+            self._fail_count = 0
+            self.status.emit("Unlocked")
+            return True
+        # Android applies timed lockouts after several wrong PINs
+        self._fail_count += 1
+        if self._fail_count >= 3:
+            self._block_until = time.monotonic() + 60
+            self._fail_count = 0
+        self.status.emit("Unlock failed: " + self._lock_debug(d))
         return False
 
     def _ensure_unlocked(self, d):
         self._wake(d)
+        if self._is_locked(d):
+            d.shell("wm dismiss-keyguard")   # clears swipe-only locks
+            time.sleep(0.6)
         attempts = 0
         while self._is_locked(d) and self._running and attempts < 2:
             self._pin_event.clear()
@@ -413,15 +717,13 @@ class StreamWorker(QThread):
                 return
             secret, self._pin = self._pin, None
             attempts += 1
-            if self._unlock(d, secret):
-                self.status.emit("Unlocked")
+            if self._try_unlock(d, secret):
                 return
-            self.status.emit("Unlock failed")
 
     def unlock_now(self, secret: str):
-        """Mid-session unlock (Ctrl+U). Runs off the UI thread."""
+        """Mid-session unlock (banner / Ctrl+U). Empty secret = just wake."""
         d = self.device
-        if not d or not secret:
+        if not d or secret is None:
             return
 
         def job():
@@ -430,42 +732,152 @@ class StreamWorker(QThread):
                 if not self._is_locked(d):
                     self.status.emit("Device already unlocked")
                     return
-                ok = self._unlock(d, secret)
-                self.status.emit("Unlocked" if ok else "Unlock failed")
+                self._try_unlock(d, secret)
             except Exception as e:
                 self.status.emit(f"Unlock error: {e!r}")
 
         threading.Thread(target=job, daemon=True).start()
 
+    def _watch_lock(self, d):
+        """Tell the UI when the phone sleeps/locks and the desktop stalls."""
+        state = None
+        while self._running:
+            time.sleep(LOCK_POLL_INTERVAL)
+            try:
+                awake = self._is_awake(d)
+                locked = awake and self._is_locked(d)
+                stale = (time.monotonic() - self._last_frame) > 2.0
+                blocked = (not awake) or (locked and stale)
+            except Exception:
+                continue
+            if blocked != state:
+                state = blocked
+                self.lock_changed.emit(blocked)
+
     # ------------------------------------------------------------------
-    # Tasks / Recents / window snapping (all best-effort, parsed from
-    # dumpsys, whose format varies a little between Android versions)
+    # Tasks on the virtual display: recents, switch, close, snap
     # ------------------------------------------------------------------
-    def _list_tasks(self, d):
-        """Returns [(task_id, 'pkg/.Activity'), ...] on the virtual display,
-        top-most first."""
+    @staticmethod
+    def _dump_tasks(d):
+        return d.shell(
+            "dumpsys activity activities | "
+            r"grep -E 'Display #|Task\{|ActivityRecord\{'")
+
+    def _task_table(self, d):
+        """[(task_id, 'pkg/.Activity', mode)] top-most first for the virtual
+        display. mode is fullscreen / freeform / ... or '?' if unreadable.
+        Parsed from `dumpsys activity activities` (best effort)."""
         did = self._get_display_id(d)
         if did is None:
             return []
-        out = d.shell("dumpsys activity activities")
-        tasks = {}
+        comps, modes, order = {}, {}, []
         cur_display = None
-        for line in out.splitlines():
+        for line in self._dump_tasks(d).splitlines():
             m = re.search(r"Display #(\d+)", line)
             if m:
                 cur_display = int(m.group(1))
                 continue
             if cur_display != did:
                 continue
-            m = re.search(r"ActivityRecord\{\w+ u\d+ ([\w.$]+/[\w.$]+) t(\d+)",
-                          line)
+            m = re.search(r"Task\{\w+ #(\d+)\b[^}]*?\bmode=([\w-]+)", line)
             if m:
-                comp, tid = m.group(1), int(m.group(2))
-                if tid not in tasks:
-                    tasks[tid] = comp
-        skip = ("launcher", "systemui", "nexuslauncher", "quickstep")
-        return [(tid, comp) for tid, comp in tasks.items()
-                if not any(s in comp.lower() for s in skip)]
+                modes[int(m.group(1))] = m.group(2)
+            m = re.search(
+                r"ActivityRecord\{\w+ u\d+ ([\w.$]+/[\w.$]+) t(\d+)", line)
+            if m:
+                tid = int(m.group(2))
+                if tid not in comps:
+                    comps[tid] = m.group(1)
+                    order.append(tid)
+        return [(t, comps[t], modes.get(t, "?")) for t in order]
+
+    @staticmethod
+    def _is_system(comp: str) -> bool:
+        low = comp.lower()
+        return "launcher" in low or "systemui" in low
+
+    def _list_tasks(self, d):
+        """[(task_id, component)] of real apps on the virtual display."""
+        return [(t, c) for t, c, _m in self._task_table(d)
+                if not self._is_system(c)]
+
+    # --- windowing -----------------------------------------------------
+    def _launch(self, d, comp, windowing=None):
+        """Start/resume comp on the virtual display. windowing: 5 = freeform
+        window, 1 = fullscreen. Same flags the launcher uses (resumes task)."""
+        did = self._get_display_id(d)
+        flag = f"--display {did} " if did is not None else ""
+        extra = f"--windowingMode {windowing} " if windowing else ""
+        return d.shell(
+            f"am start {flag}{extra}-f 0x10200000 "
+            "-a android.intent.action.MAIN "
+            "-c android.intent.category.LAUNCHER "
+            f"-n {shlex.quote(comp)}")
+
+    def _bounds_for(self, n):
+        W, H = DISPLAY_W, DISPLAY_H
+        w, h = int(W * WINDOW_FRACTION[0]), int(H * WINDOW_FRACTION[1])
+        off = (n % 6) * WINDOW_CASCADE
+        left = min(max(0, (W - w) // 2 - 2 * WINDOW_CASCADE + off), W - w)
+        top = min(int(H * 0.05) + off, max(0, H - h - int(H * 0.10)))
+        return left, top, left + w, top + h
+
+    def _make_windowed(self, d, tid, comp) -> bool:
+        """Turn an app into a draggable/resizable window. True if the phone
+        accepted it (task reports a non-fullscreen mode afterwards)."""
+        out = self._launch(d, comp, 5)
+        if re.search(r"Unknown option|Error:", out):
+            return False
+        time.sleep(0.6)
+        box = self._bounds_for(self._cascade)
+        self._cascade += 1
+        d.shell("am task resize %d %d %d %d %d" % ((tid,) + box))  # best effort
+        time.sleep(0.4)
+        for t, c, mode in self._task_table(d):
+            if t == tid or c == comp:
+                return mode not in ("fullscreen", "?")
+        return False
+
+    def _auto_window_loop(self, d):
+        """Watch for newly opened apps and switch them to windows."""
+        first = True
+        while self._running and self._auto_window_on:
+            time.sleep(1.5)
+            try:
+                if self._get_display_id(d) is None:
+                    continue
+                table = self._task_table(d)
+                if first:
+                    # Apps that were already open are left as they are
+                    self._seen_tasks = {t for t, _c, _m in table}
+                    first = False
+                    if table and all(m == "?" for _t, _c, m in table):
+                        self.status.emit(
+                            "Can't read window modes on this Android version; "
+                            "auto-window disabled. Use the Window button.")
+                        return
+                    continue
+                for tid, comp, mode in table:
+                    if tid in self._seen_tasks:
+                        continue
+                    self._seen_tasks.add(tid)
+                    if self._is_system(comp) or mode != "fullscreen":
+                        continue
+                    if self._make_windowed(d, tid, comp):
+                        self._win_fail = 0
+                    else:
+                        self._win_fail += 1
+                        if self._win_fail >= 2:
+                            self._auto_window_on = False
+                            self.status.emit(
+                                "The phone keeps apps fullscreen on this "
+                                "display. In Developer options also try "
+                                "'Force desktop mode' (same section), then "
+                                "reconnect, and send me the settings list "
+                                "printed at startup.")
+                            return
+            except Exception as e:
+                self.status.emit(f"Auto-window error: {e!r}")
 
     def request_recents(self):
         d = self.device
@@ -489,14 +901,12 @@ class StreamWorker(QThread):
 
         def job():
             try:
-                did = self._get_display_id(d)
-                disp = f"--display {did} " if did is not None else ""
-                # Same flags the launcher uses: resumes the existing task
-                d.shell(
-                    f"am start {disp}-f 0x10200000 "
-                    "-a android.intent.action.MAIN "
-                    "-c android.intent.category.LAUNCHER "
-                    f"-n {shlex.quote(comp)}")
+                if LAUNCH_FREEFORM:
+                    out = self._launch(d, comp, 5)
+                    if re.search(r"Unknown option|Error:", out):
+                        self._launch(d, comp)
+                else:
+                    self._launch(d, comp)
             except Exception as e:
                 self.status.emit(f"Open error: {e!r}")
 
@@ -518,36 +928,119 @@ class StreamWorker(QThread):
 
         threading.Thread(target=job, daemon=True).start()
 
+    def _top_app(self, d):
+        for t, c, m in self._task_table(d):
+            if not self._is_system(c):
+                return t, c, m
+        return None
+
     def snap_window(self, direction: str):
-        """Ctrl+Shift+Arrows: left/right half, maximize, centered."""
+        """Ctrl+Shift+Arrow: left/right half, maximize, or centered window.
+        Switches the app to a window first if it is fullscreen."""
+        d = self.device
+        if not d:
+            return
+        W, H = DISPLAY_W, DISPLAY_H
+        boxes = {
+            "left": (0, 0, W // 2, H),
+            "right": (W // 2, 0, W, H),
+            "up": (0, 0, W, H),
+            "down": (W // 5, H // 6, W * 4 // 5, H * 5 // 6),
+        }
+        box = boxes.get(direction)
+        if not box:
+            return
+
+        def job():
+            try:
+                top = self._top_app(d)
+                if not top:
+                    self.status.emit("Snap: no app window found")
+                    return
+                tid, comp, mode = top
+                if mode != "freeform" and not self._make_windowed(d, tid, comp):
+                    self.status.emit("Snap: this phone wouldn't make the app "
+                                     "a window")
+                    return
+                out = d.shell("am task resize %d %d %d %d %d" % ((tid,) + box))
+                if re.search(r"rror|nknown|xception", out):
+                    self.status.emit(
+                        "Snap not supported by this Android version")
+            except Exception as e:
+                self.status.emit(f"Snap error: {e!r}")
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def toggle_window(self):
+        """Window button / Ctrl+Shift+W: window <-> maximized for the top app."""
         d = self.device
         if not d:
             return
 
         def job():
             try:
-                tasks = self._list_tasks(d)
-                if not tasks:
-                    self.status.emit("No window to move")
+                top = self._top_app(d)
+                if not top:
+                    self.status.emit("No app window found")
                     return
-                tid = tasks[0][0]
-                W, H = DISPLAY_W, DISPLAY_H
-                boxes = {
-                    "left": (0, 0, W // 2, H),
-                    "right": (W // 2, 0, W, H),
-                    "up": (0, 0, W, H),
-                    "down": (W // 5, H // 6, W * 4 // 5, H * 5 // 6),
-                }
-                l, t, r, b = boxes[direction]
-                out = d.shell(f"am task resize {tid} {l} {t} {r} {b}")
-                if re.search(r"rror|nknown|xception", out):
-                    out = d.shell(
-                        f"cmd activity task resize {tid} {l} {t} {r} {b}")
-                if re.search(r"rror|nknown|xception", out):
-                    self.status.emit(
-                        "Snap not supported here (needs freeform mode)")
+                tid, comp, mode = top
+                if mode == "freeform":
+                    self._launch(d, comp, 1)
+                    self.status.emit("Maximized")
+                elif self._make_windowed(d, tid, comp):
+                    self.status.emit("Windowed: drag the top bar to move, "
+                                     "drag edges/corners to resize")
+                else:
+                    self.status.emit("This phone wouldn't make the app a "
+                                     "window")
             except Exception as e:
-                self.status.emit(f"Snap error: {e!r}")
+                self.status.emit(f"Window error: {e!r}")
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def close_active(self):
+        """Close button: stop the top app (same as the X in Recents)."""
+        d = self.device
+        if not d:
+            return
+
+        def job():
+            try:
+                top = self._top_app(d)
+                if not top:
+                    self.status.emit("No app window found")
+                    return
+                pkg = top[1].split("/")[0]
+                d.shell(f"am force-stop {shlex.quote(pkg)}")
+                self.status.emit(f"Closed {pkg.split('.')[-1]}")
+            except Exception as e:
+                self.status.emit(f"Close error: {e!r}")
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def adjust_density(self, delta: int):
+        """Ctrl +/-/0: change the virtual display's DPI live (0 = reset).
+        Scales apps AND the system bars/notifications on that display."""
+        d = self.device
+        if not d:
+            return
+
+        def job():
+            try:
+                did = self._get_display_id(d)
+                if did is None:
+                    self.status.emit("Display id not found; can't change DPI")
+                    return
+                new = DISPLAY_DPI if delta == 0 else self.current_dpi + delta
+                new = max(DPI_MIN, min(DPI_MAX, new))
+                out = d.shell(f"wm density {new} -d {did}")
+                if re.search(r"rror|xception|nknown", out):
+                    self.status.emit(f"DPI change failed: {out.strip()[:80]}")
+                else:
+                    self.current_dpi = new
+                    self.status.emit(f"Display density: {new} dpi")
+            except Exception as e:
+                self.status.emit(f"DPI error: {e!r}")
 
         threading.Thread(target=job, daemon=True).start()
 
@@ -604,7 +1097,8 @@ class StreamWorker(QThread):
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
-    def _make_decoder(self):
+    @staticmethod
+    def _make_decoder():
         codec = av.CodecContext.create("h264", "r")
         try:
             codec.thread_type = "SLICE"   # frame threading adds latency
@@ -624,19 +1118,44 @@ class StreamWorker(QThread):
             d = devices[0]
             self.device = d
 
+            # A previous run that crashed may have left settings changed
+            self._backup = _read_backup()
+            if self._backup["transient"]:
+                self._restore_transient(d)
+
+            self._probe_device(d)
+            self._dump_window_settings(d)
+
+            # Wake + unlock the physical display first, then start scrcpy
             self._ensure_unlocked(d)
             if not self._running:
                 return
+
             self._apply_desktop_settings(d)
-            self._set_animation_scale(d)
 
             self._start_server(d, random.randint(1, 0x7FFFFFFF))
             sock = self._connect_video()
+            if self._audio_mode:
+                # Server accepts: video, then audio, then control
+                try:
+                    self.audio_sock = self._connect_aux()
+                    threading.Thread(target=self._audio_loop,
+                                     args=(self.audio_sock,),
+                                     daemon=True).start()
+                except OSError as e:
+                    self.status.emit(f"Audio unavailable: {e}")
+                    self.audio_sock = None
             self.control_sock = self._connect_control()
+            threading.Thread(target=self._watch_lock, args=(d,),
+                             daemon=True).start()
+            if AUTO_WINDOW:
+                threading.Thread(target=self._auto_window_loop, args=(d,),
+                                 daemon=True).start()
             self._apply_density_override(d)
             sock.settimeout(1.0)
             self.status.emit(
-                f"Connected ({DISPLAY_W}x{DISPLAY_H} @ {DISPLAY_DPI} dpi)")
+                f"Connected ({DISPLAY_W}x{DISPLAY_H} @ {DISPLAY_DPI} dpi, "
+                f"audio: {self._audio_mode or 'off'})")
 
             codec = self._make_decoder()
             buf = bytearray()
@@ -658,7 +1177,7 @@ class StreamWorker(QThread):
                     packets = codec.parse(data)
 
                 # Decode everything (needed for reference frames) but only
-                # convert + show the newest frame of this batch.
+                # convert/paint the newest frame of this batch.
                 last = None
                 for packet in packets:
                     try:
@@ -667,28 +1186,34 @@ class StreamWorker(QThread):
                         continue
                     if frames:
                         last = frames[-1]
-                if last is None:
-                    continue
 
-                arr = last.to_ndarray(format="bgra")
-                h, w, _ = arr.shape
-                self.frame_w, self.frame_h = w, h
-                img = QImage(arr.data, w, h, 4 * w, QImage.Format.Format_RGB32)
-                img._keep = arr  # keep the buffer alive without a copy
-                self._publish(img)
+                if last is not None:
+                    arr = last.to_ndarray(format="bgra")
+                    h, w, _ = arr.shape
+                    self.frame_w, self.frame_h = w, h
+                    img = QImage(arr.data, w, h, 4 * w,
+                                 QImage.Format.Format_RGB32)
+                    img._keep = arr  # keep buffer alive; no extra copy
+                    self._publish(img)
         except Exception as e:
             self.status.emit(f"Error: {e!r}")
         finally:
             if self.display_off:
                 self.set_display_power(True)
-            for s in (sock, self.control_sock):
+            for s in (sock, self.audio_sock, self.control_sock):
                 if s:
                     try:
                         s.close()
                     except OSError:
                         pass
             if d:
-                self._restore_animation_scale(d)
+                self._restore_transient(d)
+                if (self._freeform_applied and FREEFORM_MODE == "session"
+                        and RESTART_SYSTEMUI_AFTER_FREEFORM):
+                    try:
+                        d.shell("am crash com.android.systemui")
+                    except Exception:
+                        pass
                 try:
                     d.forward_remove(f"tcp:{LOCAL_PORT}")
                 except Exception:
@@ -700,12 +1225,17 @@ class RecentsPanel(QWidget):
     closed = pyqtSignal(str)
     dismissed = pyqtSignal()
 
+    COLUMNS = 4
+
     def __init__(self, parent):
         super().__init__(parent)
         self.setObjectName("RecentsPanel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.hide()
+
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(48, 72, 48, 48)
+        outer.setContentsMargins(48, 64, 48, 48)
+        outer.setSpacing(20)
         title = QLabel("Recent apps")
         title.setObjectName("RecentsTitle")
         outer.addWidget(title)
@@ -713,18 +1243,22 @@ class RecentsPanel(QWidget):
         self._grid.setSpacing(14)
         outer.addLayout(self._grid)
         outer.addStretch(1)
-        self.hide()
 
     @staticmethod
     def _pretty(comp):
         pkg = comp.split("/")[0]
         return pkg.split(".")[-1].capitalize(), pkg
 
-    def populate(self, items):
+    def _clear(self):
         while self._grid.count():
-            w = self._grid.takeAt(0).widget()
+            item = self._grid.takeAt(0)
+            w = item.widget()
             if w:
                 w.deleteLater()
+
+    def populate(self, items):
+        """items: None = loading, [] = empty, else [(task_id, component)]."""
+        self._clear()
         if items is None or not items:
             text = "Loading..." if items is None else \
                 "No recent apps on this display"
@@ -742,14 +1276,16 @@ class RecentsPanel(QWidget):
             btn = QPushButton(f"{name}\n{pkg}")
             btn.setObjectName("CardBtn")
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setMinimumWidth(220)
             btn.clicked.connect(lambda _=False, c=comp: self.chosen.emit(c))
             x = QPushButton("X")
             x.setObjectName("CardClose")
             x.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            x.setToolTip("Close app")
             x.clicked.connect(lambda _=False, c=comp: self.closed.emit(c))
             lay.addWidget(btn, 1)
-            lay.addWidget(x, 0)
-            self._grid.addWidget(card, i // 4, i % 4)
+            lay.addWidget(x, 0, Qt.AlignmentFlag.AlignTop)
+            self._grid.addWidget(card, i // self.COLUMNS, i % self.COLUMNS)
 
     def show_items(self, items):
         self.populate(items)
@@ -757,10 +1293,13 @@ class RecentsPanel(QWidget):
         self.raise_()
 
     def mousePressEvent(self, e):
+        # click on the empty backdrop dismisses
+        self.hide()
         self.dismissed.emit()
+        e.accept()
 
     def wheelEvent(self, e):
-        e.accept()  # don't leak scrolling to the phone underneath
+        e.accept()  # don't leak scrolling to the phone
 
 
 class VideoWidget(QWidget):
@@ -771,6 +1310,9 @@ class VideoWidget(QWidget):
     unlock_shortcut = pyqtSignal()
     recents_requested = pyqtSignal()
     snap_requested = pyqtSignal(str)
+    density_requested = pyqtSignal(int)
+    window_toggle_requested = pyqtSignal()
+    close_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -781,6 +1323,7 @@ class VideoWidget(QWidget):
         self.image = None
         self._pressed = False
         self._last_move = 0.0
+        self.game_mode = False
 
         # Floating top-left toolbar
         self.toolbar = QWidget(self)
@@ -798,21 +1341,82 @@ class VideoWidget(QWidget):
 
         self.screen_btn = mk("Screen Off", 100)
         self.screen_btn.setCheckable(True)
-        self.back_btn = mk("Back", 64)
-        self.home_btn = mk("Home", 64)
-        self.recents_btn = mk("Recents", 80)
+        self.back_btn = mk("Back", 60)
+        self.home_btn = mk("Home", 60)
+        self.recents_btn = mk("Recents", 76)
+        self.mute_btn = mk("Mute", 64)
+        self.mute_btn.setCheckable(True)
+        self.dpi_down_btn = mk("A-", 40)
+        self.dpi_up_btn = mk("A+", 40)
+        self.window_btn = mk("Window", 72)
+        self.close_btn = mk("Close", 60)
         self.back_btn.clicked.connect(lambda: self.key.emit(KEY_BACK))
         self.home_btn.clicked.connect(lambda: self.key.emit(KEY_HOME))
-        self.recents_btn.clicked.connect(self.recents_requested.emit)
+        self.recents_btn.clicked.connect(lambda: self.recents_requested.emit())
+        self.dpi_down_btn.clicked.connect(
+            lambda: self.density_requested.emit(-DPI_STEP))
+        self.dpi_up_btn.clicked.connect(
+            lambda: self.density_requested.emit(DPI_STEP))
+        self.window_btn.clicked.connect(
+            lambda: self.window_toggle_requested.emit())
+        self.close_btn.clicked.connect(lambda: self.close_requested.emit())
+        self.toolbar.adjustSize()
+        self.toolbar.move(12, 12)
 
         self.recents_panel = RecentsPanel(self)
-        self.recents_panel.dismissed.connect(self.recents_panel.hide)
+        self.recents_panel.dismissed.connect(self.setFocus)
+
+        self.locked = False
+        self.lock_banner = QPushButton(
+            "Phone locked or asleep. Click to unlock (Ctrl+U)", self)
+        self.lock_banner.setObjectName("LockBanner")
+        self.lock_banner.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.lock_banner.clicked.connect(lambda: self.unlock_shortcut.emit())
+        self.lock_banner.hide()
+
+        self.toast = QLabel("", self)
+        self.toast.setObjectName("Toast")
+        self.toast.setWordWrap(True)
+        self.toast.hide()
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self.toast.hide)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.toolbar.adjustSize()
         self.toolbar.move(12, 12)
         self.recents_panel.setGeometry(self.rect())
+        self._place_overlays()
+
+    def _place_overlays(self):
+        self.lock_banner.adjustSize()
+        self.lock_banner.move(
+            (self.width() - self.lock_banner.width()) // 2, 12)
+        if self.toast.isVisible():
+            self.toast.setMaximumWidth(max(200, int(self.width() * 0.7)))
+            self.toast.adjustSize()
+            self.toast.move((self.width() - self.toast.width()) // 2,
+                            self.height() - self.toast.height() - 24)
+
+    def set_locked(self, locked: bool):
+        self.locked = locked
+        if locked:
+            self._place_overlays()
+            self.lock_banner.show()
+            self.lock_banner.raise_()
+        else:
+            self.lock_banner.hide()
+
+    def show_toast(self, text: str):
+        self.toast.setText(text)
+        self.toast.setMaximumWidth(max(200, int(self.width() * 0.7)))
+        self.toast.adjustSize()
+        self.toast.move((self.width() - self.toast.width()) // 2,
+                        self.height() - self.toast.height() - 24)
+        self.toast.show()
+        self.toast.raise_()
+        self._toast_timer.start(7000)
 
     def set_image(self, img: QImage):
         self.image = img
@@ -847,11 +1451,11 @@ class VideoWidget(QWidget):
     def mousePressEvent(self, e):
         self.setFocus()
         btn = e.button()
-        if btn == Qt.MouseButton.RightButton:      # right click = Back
-            self.key.emit(KEY_BACK)
+        if btn == Qt.MouseButton.RightButton:
+            self.key.emit(KEY_BACK)       # right click = Back
             return
-        if btn == Qt.MouseButton.MiddleButton:     # middle click = Home
-            self.key.emit(KEY_HOME)
+        if btn == Qt.MouseButton.MiddleButton:
+            self.key.emit(KEY_HOME)       # middle click = Home
             return
         if btn != Qt.MouseButton.LeftButton:
             return
@@ -866,7 +1470,7 @@ class VideoWidget(QWidget):
             return
         now = time.monotonic()
         if now - self._last_move < MOUSE_MOVE_INTERVAL:
-            return
+            return  # throttle: release always sends the exact final position
         n = self._normalize(e.position(), clamp=True)
         if n:
             self._last_move = now
@@ -898,19 +1502,37 @@ class VideoWidget(QWidget):
                 window.showFullScreen()
             return
 
-        if key == Qt.Key.Key_F9:                  # Recents
+        if key == Qt.Key.Key_F9:                 # Recents
             self.recents_requested.emit()
             return
 
-        if self.recents_panel.isVisible() and key == Qt.Key.Key_Escape:
+        if key == Qt.Key.Key_F10:                # game mode: W/A/S/D as keycodes
+            self.game_mode = not self.game_mode
+            return
+
+        if key == Qt.Key.Key_Escape and self.recents_panel.isVisible():
             self.recents_panel.hide()
             return
 
-        if ctrl and key == Qt.Key.Key_U:          # Unlock dialog
+        if ctrl and key == Qt.Key.Key_U:         # unlock dialog
             self.unlock_shortcut.emit()
             return
 
-        if ctrl and shift:                        # Window snapping
+        if ctrl and key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.density_requested.emit(DPI_STEP)    # bigger UI
+            return
+        if ctrl and key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+            self.density_requested.emit(-DPI_STEP)   # smaller UI
+            return
+        if ctrl and key == Qt.Key.Key_0:
+            self.density_requested.emit(0)           # reset
+            return
+
+        if ctrl and shift and key == Qt.Key.Key_W:   # window <-> maximize
+            self.window_toggle_requested.emit()
+            return
+
+        if ctrl and shift:                       # window snapping
             direction = {
                 Qt.Key.Key_Left: "left", Qt.Key.Key_Right: "right",
                 Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down",
@@ -922,7 +1544,9 @@ class VideoWidget(QWidget):
         if mods & (Qt.KeyboardModifier.ControlModifier |
                    Qt.KeyboardModifier.AltModifier):
             return super().keyPressEvent(e)
-        code = SPECIAL_KEYS.get(key)
+        code = GAME_KEYS.get(key) if self.game_mode else None
+        if code is None:
+            code = SPECIAL_KEYS.get(key)
         if code is not None:
             self.key.emit(code)
         elif e.text() and e.text().isprintable():
@@ -946,16 +1570,27 @@ class MainWindow(QMainWindow):
         self.worker.status.connect(self.on_status)
         self.worker.pin_requested.connect(self.on_pin_requested)
         self.worker.recents_ready.connect(self.view.recents_panel.show_items)
+        self.worker.lock_changed.connect(self.view.set_locked)
+
+        self.audio = (AudioPlayer()
+                      if HAVE_AUDIO and AUDIO_MODE != "off" else None)
+        if self.audio and self.audio.ok:
+            self.worker.audio_data.connect(self.audio.write)
+        self.view.mute_btn.clicked.connect(self.on_mute_toggle)
+        self.view.density_requested.connect(self.worker.adjust_density)
+        self.view.window_toggle_requested.connect(self.worker.toggle_window)
+        self.view.close_requested.connect(self.worker.close_active)
 
         self.view.touch.connect(self.worker.send_touch)
         self.view.scroll.connect(self.worker.send_scroll)
         self.view.key.connect(self.worker.send_keycode)
         self.view.text.connect(self.worker.send_text)
         self.view.unlock_shortcut.connect(self.on_unlock_shortcut)
-        self.view.recents_requested.connect(self.on_recents_requested)
         self.view.snap_requested.connect(self.worker.snap_window)
+        self.view.recents_requested.connect(self.on_recents_requested)
         self.view.recents_panel.chosen.connect(self.on_task_chosen)
         self.view.recents_panel.closed.connect(self.worker.close_app)
+
         self.view.screen_btn.clicked.connect(self.on_screen_toggle)
 
         self.worker.start()
@@ -968,47 +1603,60 @@ class MainWindow(QMainWindow):
 
     def _ask_secret(self):
         secret, ok = QInputDialog.getText(
-            self, "Device Locked", "Enter PIN / password:",
+            self, "Unlock phone",
+            "Enter PIN / password (leave empty to just wake the phone):",
             QLineEdit.EchoMode.Password)
         self.view.setFocus()
-        return secret if ok and secret else None
+        return secret if ok else None
 
     def on_pin_requested(self):
         self.worker.provide_pin(self._ask_secret())
 
     def on_unlock_shortcut(self):
         secret = self._ask_secret()
-        if secret:
+        if secret is not None:
             self.worker.unlock_now(secret)
 
     def on_recents_requested(self):
         panel = self.view.recents_panel
         if panel.isVisible():
             panel.hide()
+            self.view.setFocus()
             return
-        panel.show_items(None)          # "Loading..." while we query
+        panel.show_items(None)          # "Loading..." instantly
         self.worker.request_recents()
 
     def on_task_chosen(self, comp):
         self.view.recents_panel.hide()
-        self.worker.open_task(comp)
         self.view.setFocus()
+        self.worker.open_task(comp)
 
     def on_screen_toggle(self, checked):
         self.worker.set_display_power(not checked)
         self.view.screen_btn.setText("Screen On" if checked else "Screen Off")
 
+    def on_mute_toggle(self, checked):
+        if self.audio:
+            self.audio.muted = checked
+        self.view.mute_btn.setText("Unmute" if checked else "Mute")
+
     def on_status(self, s):
         print(s)
+        self.view.show_toast(s)
 
     def closeEvent(self, e):
         self.worker.set_display_power(True)
         self.worker.stop()
-        self.worker.wait(3000)
+        self.worker.wait(5000)
+        if self.audio:
+            self.audio.close()
         super().closeEvent(e)
 
 
 if __name__ == "__main__":
+    if "--restore" in sys.argv:
+        restore_phone_settings()
+        sys.exit(0)
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
